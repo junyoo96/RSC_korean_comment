@@ -28,7 +28,7 @@ class ResNet(nn.Module):
         self.class_classifier = nn.Linear(512 * block.expansion, classes)
         #self.domain_classifier = nn.Linear(512 * block.expansion, domains)
         self.pecent = 1/3
-
+        
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
                 nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
@@ -88,6 +88,8 @@ class ResNet(nn.Module):
             
             #x_new_view shape : (128,512)
             x_new_view = x_new_view.view(x_new_view.size(0), -1)
+            #output(vector of class score)
+                #shape : (128,7) 
             output = self.class_classifier(x_new_view)
             # print("output",output.shape)
             class_num = output.shape[1]
@@ -141,11 +143,11 @@ class ResNet(nn.Module):
 
             #50% 확률에 따라 spatial-wise 또는 channel wise 선택
             choose_one = random.randint(0, 9)
-            if choose_one <= 9:
+            if choose_one <= 4:
                 # ---------------------------- spatial -----------------------
                 #HW보다 크거나 같은 숫자 중 가장 작은 정수(HW가 49면,16), feature drop percentage인 33.3% 인듯
                 spatial_drop_num = math.ceil(HW * 1 / 3.0)
-                print(spatial_drop_num)
+                # print(spatial_drop_num)
                 #th18_mask_value shape : (128)
                     # 이게 뭔지 잘 모르겠음
                     # 각 채널의 spatial_mean을 sort해서 상위 33.3%에 위치한 값 찾기
@@ -153,53 +155,91 @@ class ResNet(nn.Module):
                 ##th18_mask_value shape : (128,49)
                 th18_mask_value = th18_mask_value.view(num_rois, 1).expand(num_rois, 49)
                 # print("th18_mask_value",th18_mask_value.shape,th18_mask_value)
-                #mask_all_cuda : mask feature map만드는 과정
+                #mask_all_cuda : feature map에 곱할 mask map 만드는 과정
                     # spatial_mean이 아까 찾은 상위 33.3%에 위치한 값보다 크면 mask feature map에서 그 자리를 0으로 채우고
                     # 아니면, 1로 채움 
                     # shape : (128,49)
                 mask_all_cuda = torch.where(spatial_mean > th18_mask_value, torch.zeros(spatial_mean.shape).cuda(),
                                             torch.ones(spatial_mean.shape).cuda())
                 # print("mask_all_cuda",mask_all_cuda.shape, mask_all_cuda)
-                #mask_all : 실제 사용될 mask feature map 
-                    # shape : (128,1, 7, 7)
+                #mask_all : feature map에 곱할 mask map
+                    # shape : (128, 1, 7, 7)
                 mask_all = mask_all_cuda.reshape(num_rois, H, H).view(num_rois, 1, H, H)
             else:
                 # -------------------------- channel ----------------------------
                 vector_thresh_percent = math.ceil(num_channel * 1 / 3.2)
+                #channel_mean의 상위 33.3%값 계산
                 vector_thresh_value = torch.sort(channel_mean, dim=1, descending=True)[0][:, vector_thresh_percent]
+                #channel_mean값의 상위 33.3값들로 채워진 vector 생성
+                    # shape : (128, 512)
                 vector_thresh_value = vector_thresh_value.view(num_rois, 1).expand(num_rois, num_channel)
+                # print("vector_thresh_value",vector_thresh_value.shape)
+                #값 비교해서 channel_mean의 값이 상위 33.3%값보다 크면 그 자리에 0, 아니면 1로 채우기
                 vector = torch.where(channel_mean > vector_thresh_value,
                                      torch.zeros(channel_mean.shape).cuda(),
                                      torch.ones(channel_mean.shape).cuda())
+                #mask_all : feature vector에 곱할 mask vector 
+                    #shape : (128, 512, 1, 1)
                 mask_all = vector.view(num_rois, num_channel, 1, 1)
 
             # ----------------------------------- batch ----------------------------------------
+            ##mask 곱하기 이전의 feature vector(class score) 이후의 feature vector를 각각 구하기
+            #1.mask 곱하기 이전의 feature vector(class score)
             cls_prob_before = F.softmax(output, dim=1)
+            
+            #2.mask 곱한 이후의 feature vector(class score)
+            #x_new_view_after : x_new에다 mask vector를 곱한 것
+                #x_new_view_after shape : (128,512,7,7)
             x_new_view_after = x_new * mask_all
+            #x_new_view_after shape : (128,512,1,1)
             x_new_view_after = self.avgpool(x_new_view_after)
+            #x_new_view_after shape : (128,512)
             x_new_view_after = x_new_view_after.view(x_new_view_after.size(0), -1)
             x_new_view_after = self.class_classifier(x_new_view_after)
+            #mask 곱한 이후의 feature vector(class score)
             cls_prob_after = F.softmax(x_new_view_after, dim=1)
 
             sp_i = torch.ones([2, num_rois]).long()
             sp_i[0, :] = torch.arange(num_rois)
             sp_i[1, :] = index
             sp_v = torch.ones([num_rois])
+            #라벨들 one hote vector로 만들어주기
             one_hot_sparse = torch.sparse.FloatTensor(sp_i, sp_v, torch.Size([num_rois, class_num])).to_dense().cuda()
+            #라벨에 해당하는 mask 곱하기 이전에 계산한 class score 총합 계산
             before_vector = torch.sum(one_hot_sparse * cls_prob_before, dim=1)
+            ##라벨에 해당하는 mask 곱한 이후에 계산한 class score 총합 계산
             after_vector = torch.sum(one_hot_sparse * cls_prob_after, dim=1)
+            #mask곱하기 이전과 곱한 이후의 class score 차이 계산
+                #mask를 곱하기 이전과 이후의 차이나는 특징을 찾기 위함인듯 
             change_vector = before_vector - after_vector - 0.0001
+            #곱하기 이전이 곱한 이후의 class score 보다
+                #크면, change_vector 값 그대로 사용 ( 곱하기 이전이 크다는 얘기는 prediction에 큰 영향을 주는 값이라는 얘기)
+                #작으면, 모두 0으로 채워서 사용    
             change_vector = torch.where(change_vector > 0, change_vector, torch.zeros(change_vector.shape).cuda())
+            #th_fg_value : change vector 값중 상위 33.3%값
             th_fg_value = torch.sort(change_vector, dim=0, descending=True)[0][int(round(float(num_rois) * self.pecent))]
+            #change_vector의 element와 change vector 값중 상위 33.3%값 비교해서 true 또는 false반환
             drop_index_fg = change_vector.gt(th_fg_value).long()
+            #ignore_index_fg : drop_index_fg인 것 0인거 1로, 1인거 0으로 바꾸기
+                #이러면, 상위 33.3%값보다 아래있는 애들이 1, 위에 있는 애들이 0이 됨
             ignore_index_fg = 1 - drop_index_fg
+            #not_01_ignore_index_fg : 0이 아닌 index만 저장된 vector 값    
             not_01_ignore_index_fg = ignore_index_fg.nonzero()[:, 0]
+            
+            
+            #batch단위로 한 샘플마다 곱하기 이후의 class score가 더 큰 샘플은 1로 만들어주게됨
+                #곱하기 이전의 class score가 큰 샘플은은 class score값을 0으로 만들어줌
+            #mask 곱하기 이전의 class score가 큰 샘플은 dominant한 feature를 갖으니까 mask로 0을 
+            #곱해줘서 값을 0으로 만들어줘서 학습못하게 하고,
+            #mask 곱하기 이후의 class score가 큰 샘플은 보다 generalized feature를 갖으니까 mask로 1을
+            #곱해줘서 값을 1로 만들어주는 코드
             mask_all[not_01_ignore_index_fg.long(), :] = 1
 
+            #mask만들고 실제 학습 시작
             self.train()
             mask_all = Variable(mask_all, requires_grad=True)
+            #layer4에서 output인 feature map에 mask를 씌워줌 
             x = x * mask_all
-
         
         x = self.avgpool(x)
         
